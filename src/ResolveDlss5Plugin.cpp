@@ -8,11 +8,15 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "AntiFlicker.h"
 #include "ColorPipeline.h"
@@ -73,6 +77,30 @@ enum class OutputView : int {
     LeftRightCompare = 2,
 };
 
+// --- Idle-instance GPU release (LRU) -------------------------------------
+// Resolve keeps one OFX instance alive per clip/node for as long as the project
+// is open. Each instance owns its own NGX feature(s), D3D12 textures, optical
+// flow and anti-flicker GPU state, so VRAM grows clip by clip during a long
+// export. Only the most recently rendered instances keep their GPU state; the
+// rest release it after a short idle time and re-initialize lazily on demand.
+int lruMaxActiveInstances() {
+    static const int value = [] {
+        const char* text = std::getenv("RESOLVE_DLSS5_MAX_ACTIVE");
+        const int parsed = text ? std::atoi(text) : 0;
+        return parsed >= 1 ? parsed : 2;
+    }();
+    return value;
+}
+std::chrono::milliseconds lruIdleThreshold() {
+    static const std::chrono::milliseconds value = [] {
+        const char* text = std::getenv("RESOLVE_DLSS5_IDLE_SECONDS");
+        const double parsed = text ? std::atof(text) : -1.0;
+        const double seconds = parsed >= 0.0 ? parsed : 2.0;
+        return std::chrono::milliseconds(static_cast<long long>(seconds * 1000.0));
+    }();
+    return value;
+}
+
 class ResolveDlss5Plugin final : public OFX::ImageEffect {
    public:
     explicit ResolveDlss5Plugin(OfxImageEffectHandle handle)
@@ -101,11 +129,18 @@ class ResolveDlss5Plugin final : public OFX::ImageEffect {
     }
 
     ~ResolveDlss5Plugin() override {
+        {
+            std::scoped_lock registryLock(registryMutex());
+            registry().remove(this);
+        }
+        // Wait for an eviction that may still be releasing this instance.
+        { std::scoped_lock waitForEviction(stateMutex_); }
         resolve_dlss5::writeDiagnosticLog("OFX effect instance destroyed");
     }
 
     void render(const OFX::RenderArguments& arguments) override {
         std::scoped_lock lock(stateMutex_);
+        touchAndReleaseIdleInstances();
         const bool preview = arguments.interactiveRenderStatus || sequenceInteractive_;
         renderStage_ = "render-arguments";
         renderBounds_ = {};
@@ -471,6 +506,69 @@ class ResolveDlss5Plugin final : public OFX::ImageEffect {
     }
 
    private:
+    static std::mutex& registryMutex() {
+        static std::mutex mutex;
+        return mutex;
+    }
+    // Front = most recently rendered. gpuHeld_/lastRender_ are guarded by
+    // registryMutex().
+    static std::list<ResolveDlss5Plugin*>& registry() {
+        static std::list<ResolveDlss5Plugin*> instances;
+        return instances;
+    }
+
+    // Caller holds this->stateMutex_. Other instances are only try-locked, so a
+    // busy instance is never waited on and lock order cannot deadlock.
+    void touchAndReleaseIdleInstances() noexcept {
+        using Clock = std::chrono::steady_clock;
+        std::vector<std::pair<ResolveDlss5Plugin*, std::unique_lock<std::mutex>>> victims;
+        try {
+            const auto now = Clock::now();
+            const int maxActive = lruMaxActiveInstances();
+            const auto idle = lruIdleThreshold();
+            std::scoped_lock registryLock(registryMutex());
+            auto& instances = registry();
+            instances.remove(this);
+            instances.push_front(this);
+            lastRender_ = now;
+            gpuHeld_ = true;
+            int kept = 0;
+            for (auto* other : instances) {
+                if (!other->gpuHeld_) continue;
+                if (other == this || kept < maxActive || now - other->lastRender_ < idle) {
+                    ++kept;
+                    continue;
+                }
+                std::unique_lock<std::mutex> otherLock(other->stateMutex_, std::try_to_lock);
+                if (!otherLock.owns_lock()) {
+                    ++kept;
+                    continue;
+                }
+                other->gpuHeld_ = false;
+                victims.emplace_back(other, std::move(otherLock));
+            }
+        } catch (...) {
+        }
+        for (auto& victim : victims) victim.first->releaseGpuState();
+    }
+
+    // Caller holds this->stateMutex_ (via the evicting instance).
+    void releaseGpuState() noexcept {
+        try {
+            timeline_.invalidate();
+            antiFlicker_.setGpuDevice(nullptr);
+            antiFlicker_.invalidate();
+            guidance_.invalidate();
+            sharedMotion_.reset();
+            flow_.reset();
+            runtime_->reset();
+            resetRequested_ = true;
+            resolve_dlss5::writeDiagnosticLog("LRU: released GPU state of idle OFX instance");
+        } catch (...) {
+            resetRequested_ = true;
+        }
+    }
+
     void resetAfterFailure() noexcept {
         try {
             timeline_.invalidate();
@@ -912,6 +1010,8 @@ class ResolveDlss5Plugin final : public OFX::ImageEffect {
     bool resetRequested_ = true;
     std::uint64_t renderCount_ = 0;
     std::chrono::steady_clock::time_point lastTimingLog_{};
+    bool gpuHeld_ = false;
+    std::chrono::steady_clock::time_point lastRender_{};
 };
 
 OFX::BooleanParamDescriptor* defineBoolean(OFX::ImageEffectDescriptor& descriptor, const char* name,
