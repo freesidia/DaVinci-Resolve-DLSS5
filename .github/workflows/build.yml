@@ -1,0 +1,118 @@
+name: Build ResolveDlss5 (LRU GPU release)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - ".github/workflows/build.yml"
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+        with:
+          path: plugin
+
+      - name: Checkout OpenFX SDK
+        uses: actions/checkout@v4
+        with:
+          repository: AcademySoftwareFoundation/openfx
+          path: deps/openfx
+
+      - name: Checkout NVIDIA DLSS SDK
+        uses: actions/checkout@v4
+        with:
+          repository: NVIDIA/DLSS
+          path: deps/DLSS
+          lfs: true
+          sparse-checkout: |
+            include
+            lib/Windows_x86_64/x64
+
+      - name: Checkout NVIDIA Optical Flow SDK headers
+        uses: actions/checkout@v4
+        with:
+          repository: NVIDIA/NVIDIAOpticalFlowSDK
+          path: deps/nvof
+
+      - name: Checkout FidelityFX SDK v2.3.0
+        uses: actions/checkout@v4
+        with:
+          repository: GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+          ref: v2.3.0
+          path: deps/FidelityFX
+          sparse-checkout: |
+            Kits/FidelityFX
+
+      - name: Install CUDA 12
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: "12.6.3"
+          method: network
+          sub-packages: '["nvcc", "cudart"]'
+
+      - name: Prepare dependency paths
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ws = $env:GITHUB_WORKSPACE
+
+          # Resolve-style OpenFX layout: OpenFX-1.4/include + Support/include + Support/Library
+          $ofx = Join-Path $ws 'deps/ResolveOFX'
+          New-Item -ItemType Directory -Force "$ofx/OpenFX-1.4" | Out-Null
+          Copy-Item -Recurse "$ws/deps/openfx/include" "$ofx/OpenFX-1.4/include"
+          Copy-Item -Recurse "$ws/deps/openfx/Support" "$ofx/Support"
+
+          # NVOF header directory
+          $nvofHeader = Get-ChildItem -Recurse "$ws/deps/nvof" -Filter nvOpticalFlowCuda.h | Select-Object -First 1
+          if (-not $nvofHeader) { throw 'nvOpticalFlowCuda.h not found' }
+
+          # DXC + FXC from the Windows SDK
+          $dxc = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\dxc.exe' |
+                 Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $dxc) { throw 'dxc.exe not found in Windows SDK' }
+
+          $lib = "$ws/deps/DLSS/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib"
+          if ((Get-Item $lib).Length -lt 10000) { throw "nvsdk_ngx_s.lib looks like an LFS pointer" }
+
+          "RESOLVE_OFX_SDK_ROOT=$ofx"                  >> $env:GITHUB_ENV
+          "DLSS_SDK_ROOT=$ws/deps/DLSS"               >> $env:GITHUB_ENV
+          "FIDELITYFX_SDK_ROOT=$ws/deps/FidelityFX"   >> $env:GITHUB_ENV
+          "NVOF_SDK_ROOT=$($nvofHeader.DirectoryName)" >> $env:GITHUB_ENV
+          "DXC_PATH=$($dxc.FullName)"                 >> $env:GITHUB_ENV
+          Write-Host "DXC: $($dxc.FullName)"
+          Write-Host "NVOF: $($nvofHeader.DirectoryName)"
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S plugin/src -B build -G "Visual Studio 17 2022" -A x64 `
+            -DRESOLVE_DLSS5_BUILD_SMOKE_TEST=OFF `
+            "-DRESOLVE_OFX_SDK_ROOT=$env:RESOLVE_OFX_SDK_ROOT" `
+            "-DDLSS_SDK_ROOT=$env:DLSS_SDK_ROOT" `
+            "-DFIDELITYFX_SDK_ROOT=$env:FIDELITYFX_SDK_ROOT" `
+            "-DNVOF_SDK_ROOT=$env:NVOF_SDK_ROOT" `
+            "-DDXC_PATH=$env:DXC_PATH"
+
+      - name: Build plugin
+        run: cmake --build build --config Release --target ResolveDlss5 --parallel
+
+      - name: Collect output
+        shell: pwsh
+        run: |
+          $ofxFile = Get-ChildItem -Recurse build -Filter ResolveDlss5.ofx |
+                     Where-Object { $_.FullName -like '*Contents*Win64*' } | Select-Object -First 1
+          if (-not $ofxFile) { $ofxFile = Get-ChildItem -Recurse build -Filter ResolveDlss5.ofx | Select-Object -First 1 }
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item $ofxFile.FullName out/ResolveDlss5.ofx
+          Get-FileHash out/ResolveDlss5.ofx | Format-List
+
+      - name: Upload plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: ResolveDlss5-ofx-lru
+          path: out/ResolveDlss5.ofx
