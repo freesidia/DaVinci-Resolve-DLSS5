@@ -1188,13 +1188,13 @@ void ResolveDlss5PluginFactory::describe(OFX::ImageEffectDescriptor& descriptor)
     descriptor.setTemporalClipAccess(true);
     descriptor.setRenderTwiceAlways(false);
     descriptor.setSupportsMultipleClipPARs(kSupportsMultipleClipPars);
-    descriptor.setSupportsOpenCLRender(false);
+    // setSupportsOpenCLRender(false) is a Resolve-SDK-only helper; false is the default.
     // The first functional backend is a CPU-facing OFX bridge into a private
     // D3D12 session. CUDA is intentionally not advertised until the shared
     // CUDA/D3D12 texture path is implemented.
     descriptor.setSupportsCudaRender(false);
     descriptor.setSupportsCudaStream(false);
-    descriptor.setNoSpatialAwareness(false);
+    // setNoSpatialAwareness(false) is a Resolve-SDK-only helper; false is the default.
     resolve_dlss5::writeDiagnosticLog("OFX describe completed");
 } catch (const std::exception& error) {
     resolve_dlss5::writeDiagnosticLog(std::string("OFX describe exception: ") + error.what());
