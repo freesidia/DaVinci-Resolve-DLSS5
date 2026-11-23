@@ -49,9 +49,9 @@ jobs:
             Kits/FidelityFX
 
       - name: Install CUDA 12
-        uses: Jimver/cuda-toolkit@v0.2.19
+        uses: Jimver/cuda-toolkit@v0.2.36
         with:
-          cuda: "12.6.3"
+          cuda: "12.9.1"
           method: network
           sub-packages: '["nvcc", "cudart"]'
 
